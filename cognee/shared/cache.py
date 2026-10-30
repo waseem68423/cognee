@@ -8,6 +8,7 @@ backends (like S3) through the StorageManager abstraction.
 import asyncio
 import hashlib
 import logging
+import posixpath
 import zipfile
 from io import BytesIO
 
@@ -19,6 +20,51 @@ from cognee.infrastructure.files.storage.StorageManager import StorageManager
 from cognee.shared.utils import create_secure_ssl_context
 
 logger = logging.getLogger(__name__)
+
+
+def _zip_member_path(cache_dir: str, member_name: str) -> str:
+    """Return the storage path a ZIP member may be extracted to.
+
+    A member has to land beneath ``cache_dir``. The local storage backend only
+    rejects paths outside the storage root, so an entry such as
+    ``../sibling-cache/state.json`` stays inside the root while overwriting a
+    different cache. Members are resolved here, before the archive is read, so a
+    rejected archive never leaves a partially extracted cache behind.
+
+    Args:
+        cache_dir: Directory the archive is extracted into.
+        member_name: The member's name as recorded in the archive.
+
+    Returns:
+        The path to write the member to.
+
+    Raises:
+        ValueError: The member is empty, absolute, carries a drive letter, or
+            resolves outside ``cache_dir``.
+    """
+    # ZIP names are POSIX and may legitimately carry backslashes as characters.
+    # They are treated as separators here so a Windows-style traversal is caught
+    # on every platform.
+    member_path = member_name.replace("\\", "/")
+    normalized = posixpath.normpath(member_path)
+    has_drive_letter = len(member_path) > 1 and member_path[1] == ":" and member_path[0].isalpha()
+
+    if (
+        not member_path
+        or member_path.startswith("/")
+        or has_drive_letter
+        or normalized in (".", "..")
+        or normalized.startswith(("/", "../"))
+    ):
+        raise ValueError(f"Refusing to extract ZIP member {member_name!r} outside {cache_dir}.")
+
+    # Not normpath'd as a whole: it would collapse the "//" of an s3:// URL.
+    cache_root = cache_dir.rstrip("/")
+    target_path = posixpath.join(cache_root, normalized)
+    if cache_root and not target_path.startswith(f"{cache_root}/"):
+        raise ValueError(f"Refusing to extract ZIP member {member_name!r} outside {cache_dir}.")
+
+    return target_path
 
 
 class StorageAwareCache:
@@ -170,6 +216,10 @@ class StorageAwareCache:
 
         Returns:
             Path to the cached directory
+
+        Raises:
+            ValueError: The archive has a member that resolves outside the
+                cache subdirectory. Nothing is written for such an archive.
         """
         cache_dir = await self.get_cache_subdir(cache_subdir_name)
 
@@ -209,20 +259,24 @@ class StorageAwareCache:
                 zip_content.write(chunk)
         zip_content.seek(0)
 
-        # Extract the archive
-        await self.storage_manager.ensure_directory_exists(cache_dir)
-
         # Extract files and store them using StorageManager
         with zipfile.ZipFile(zip_content, "r") as zip_file:
-            for file_info in zip_file.infolist():
+            # Resolve every member before the first write, so one escaping entry
+            # cannot leave a half-extracted cache behind.
+            members = [
+                (file_info, _zip_member_path(cache_dir, file_info.filename))
+                for file_info in zip_file.infolist()
+            ]
+
+            await self.storage_manager.ensure_directory_exists(cache_dir)
+
+            for file_info, file_path in members:
                 if file_info.is_dir():
                     # Create directory
-                    dir_path = f"{cache_dir}/{file_info.filename}"
-                    await self.storage_manager.ensure_directory_exists(dir_path)
+                    await self.storage_manager.ensure_directory_exists(file_path)
                 else:
                     # Extract and store file
                     file_data = zip_file.read(file_info.filename)
-                    file_path = f"{cache_dir}/{file_info.filename}"
                     await self.storage_manager.store(file_path, BytesIO(file_data), overwrite=True)
 
         # Write version info for future cache validation
